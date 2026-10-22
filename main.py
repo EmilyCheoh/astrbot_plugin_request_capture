@@ -5,6 +5,7 @@ The commands manage the saved local JSON files and export pretty copies on deman
 """
 
 import asyncio
+import base64
 import json
 import math
 import re
@@ -18,7 +19,6 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File
 from astrbot.api.star import Context, Star, StarTools
-
 
 class RequestCapture(Star):
     _GEMINI_PATH = re.compile(r"(?:^|/)models/[^/]+:(?:streamGenerateContent|generateContent)$")
@@ -110,31 +110,37 @@ class RequestCapture(Star):
     @filter.command("print")
     async def print_control(self, event: AstrMessageEvent, action: str = ""):
         """/print: state; /print on: capture; /print off: stop capture."""
-        action = action.lower()
-        if action == "":
-            state = "已开启 🟢" if self.enabled else "已关闭 ⚪"
-            yield event.plain_result(
-                f"🐈‍⬛ 请求体记录：{state}\n"
-                "开启：/print on\n关闭：/print off"
-            )
-        elif action == "on":
-            self.enabled = True
-            attached = self._attach_to_providers()
-            logger.info(
-                "[request-capture] ON; hooked %d additional clients; dir=%s",
-                attached,
-                self.output_dir,
-            )
-            yield event.plain_result(
-                "🐈‍⬛ 请求体记录已开启。后续 LLM 请求会保存 JSON。"
-                f"\n目录：{self.output_dir}"
-            )
-        elif action == "off":
-            self.enabled = False
-            logger.info("[request-capture] OFF")
-            yield event.plain_result("🐈‍⬛ 请求体记录已关闭。已有 JSON 文件保留。")
-        else:
-            yield event.plain_result("🐈‍⬛ 用法：/print、/print on、/print off")
+        # AstrBot v4.24.5: call_llm=True disables the default agent fallback.
+        event.should_call_llm(True)
+        try:
+            action = action.lower()
+            if action == "":
+                state = "已开启 🟢" if self.enabled else "已关闭 ⚪"
+                yield event.plain_result(
+                    f"🐈‍⬛ 请求体记录：{state}\n"
+                    "开启：/print on\n关闭：/print off"
+                )
+            elif action == "on":
+                self.enabled = True
+                attached = self._attach_to_providers()
+                logger.info(
+                    "[request-capture] ON; hooked %d additional clients; dir=%s",
+                    attached,
+                    self.output_dir,
+                )
+                yield event.plain_result(
+                    "🐈‍⬛ 请求体记录已开启。后续 LLM 请求会保存 JSON。"
+                    f"\n目录：{self.output_dir}"
+                )
+            elif action == "off":
+                self.enabled = False
+                logger.info("[request-capture] OFF")
+                yield event.plain_result("🐈‍⬛ 请求体记录已关闭。已有 JSON 文件保留。")
+            else:
+                yield event.plain_result("🐈‍⬛ 用法：/print、/print on、/print off")
+        finally:
+            # Run only after the reply has been handed to the respond stage.
+            event.stop_event()
 
     @staticmethod
     def _arguments(event: AstrMessageEvent) -> str:
@@ -195,156 +201,185 @@ class RequestCapture(Star):
     @filter.command("请求体", alias={"requestbody"})
     async def requestbody(self, event: AstrMessageEvent):
         """Manage saved request bodies. No arguments shows help."""
-        argument_text = self._arguments(event)
-        if not argument_text:
-            yield event.plain_result(self._help())
-            return
-
-        action, _, remainder = argument_text.partition(" ")
-        action = action.lower()
-        remainder = remainder.strip()
-
-        if action in {"help", "帮助"}:
-            yield event.plain_result(self._help())
-            return
-
-        if action in {"list", "ls"}:
-            if remainder and (not remainder.isascii() or not remainder.isdecimal()):
-                yield event.plain_result("🐈‍⬛ 页码请填正整数，例如 /请求体 list 2")
-                return
-            page = int(remainder) if remainder else 1
-            files = self._saved_files()
-            if not files:
-                yield event.plain_result("🐈‍⬛ 暂无请求体文件。发送 /print on 开始记录。")
-                return
-            total_pages = math.ceil(len(files) / self._PAGE_SIZE)
-            if page < 1 or page > total_pages:
-                yield event.plain_result(f"🐈‍⬛ 页码超出范围。当前共 {total_pages} 页。")
+        event.should_call_llm(True)  # Prevent LLM fallback when a file send fails.
+        try:
+            argument_text = self._arguments(event)
+            if not argument_text:
+                yield event.plain_result(self._help())
                 return
 
-            start = (page - 1) * self._PAGE_SIZE
-            visible = files[start:start + self._PAGE_SIZE]
-            lines = [
-                f"🐈‍⬛ 请求体列表（共 {len(files)} 个）",
-                f"第 {page}/{total_pages} 页 · {start + 1}–{start + len(visible)}",
-                "",
-            ]
-            lines.extend(f"{start + i}. {path.name}" for i, path in enumerate(visible, 1))
-            lines.append("\n────────────")
-            if page > 1:
-                lines.append(f"上一页：/requestbody list {page - 1}")
-            if page < total_pages:
-                lines.append(f"下一页：/requestbody list {page + 1}")
-            lines.extend([
-                "发送：/requestbody send 编号",
-                "重命名：/requestbody rename 编号 新名字",
-                "删除：/requestbody delete 编号",
-            ])
-            yield event.plain_result("\n".join(lines))
-            return
+            action, _, remainder = argument_text.partition(" ")
+            action = action.lower()
+            remainder = remainder.strip()
 
-        if action in {"send", "发送"}:
-            raw_mode = False
-            # Keep filenames containing spaces intact; 'raw' is a trailing option.
-            if remainder.lower().endswith(" raw"):
-                raw_mode = True
-                remainder = remainder[:-4].strip()
-            files = self._saved_files()
-            selected = self._select_file(remainder, files)
-            if not selected:
-                yield event.plain_result("🐈‍⬛ 找不到指定文件。用 /请求体 list 查看编号。")
+            if action in {"help", "帮助"}:
+                yield event.plain_result(self._help())
                 return
 
-            path_to_send = selected
-            if not raw_mode:
+            if action in {"list", "ls"}:
+                if remainder and (not remainder.isascii() or not remainder.isdecimal()):
+                    yield event.plain_result("🐈‍⬛ 页码请填正整数，例如 /请求体 list 2")
+                    return
+                page = int(remainder) if remainder else 1
+                files = self._saved_files()
+                if not files:
+                    yield event.plain_result("🐈‍⬛ 暂无请求体文件。发送 /print on 开始记录。")
+                    return
+                total_pages = math.ceil(len(files) / self._PAGE_SIZE)
+                if page < 1 or page > total_pages:
+                    yield event.plain_result(f"🐈‍⬛ 页码超出范围。当前共 {total_pages} 页。")
+                    return
+
+                start = (page - 1) * self._PAGE_SIZE
+                visible = files[start:start + self._PAGE_SIZE]
+                lines = [
+                    f"🐈‍⬛ 请求体列表（共 {len(files)} 个）",
+                    f"第 {page}/{total_pages} 页 · {start + 1}–{start + len(visible)}",
+                    "",
+                ]
+                lines.extend(f"{start + i}. {path.name}" for i, path in enumerate(visible, 1))
+                lines.append("\n────────────")
+                if page > 1:
+                    lines.append(f"上一页：/requestbody list {page - 1}")
+                if page < total_pages:
+                    lines.append(f"下一页：/requestbody list {page + 1}")
+                lines.extend([
+                    "发送：/requestbody send 编号",
+                    "重命名：/requestbody rename 编号 新名字",
+                    "删除：/requestbody delete 编号",
+                ])
+                yield event.plain_result("\n".join(lines))
+                return
+
+            if action in {"send", "发送"}:
+                raw_mode = False
+                # Keep filenames containing spaces intact; 'raw' is a trailing option.
+                if remainder.lower().endswith(" raw"):
+                    raw_mode = True
+                    remainder = remainder[:-4].strip()
+                files = self._saved_files()
+                selected = self._select_file(remainder, files)
+                if not selected:
+                    yield event.plain_result("🐈‍⬛ 找不到指定文件。用 /请求体 list 查看编号。")
+                    return
+
                 try:
-                    raw = await asyncio.to_thread(selected.read_bytes)
-                    pretty = json.dumps(json.loads(raw), ensure_ascii=False, indent=2) + "\n"
-                except (ValueError, UnicodeError):
-                    # Do not change non-JSON capture contents.
-                    logger.warning("[request-capture] Invalid JSON; sending raw: %s", selected.name)
+                    file_bytes = await asyncio.to_thread(selected.read_bytes)
+                    if not raw_mode:
+                        try:
+                            formatted = json.dumps(
+                                json.loads(file_bytes), ensure_ascii=False, indent=2
+                            ) + "\n"
+                            file_bytes = formatted.encode("utf-8")
+                        except (ValueError, UnicodeError):
+                            logger.warning(
+                                "[request-capture] Invalid JSON; sending raw: %s",
+                                selected.name,
+                            )
                 except OSError as exc:
                     logger.warning("[request-capture] Read failed: %s", exc)
                     yield event.plain_result("🐈‍⬛ 读取请求体失败，请查看日志。")
                     return
-                else:
-                    temp_path = None
+
+                # QQ/NapCat runs in its own container. Never send it an AstrBot
+                # /tmp path: deliver the bytes via OneBot's upload_private_file.
+                # NapCat decodes base64:// itself on its own filesystem.
+                if getattr(event, "bot", None) is not None and event.get_sender_id().isdigit() and not event.get_group_id():
+                    try:
+                        await event.bot.call_action(
+                            "upload_private_file",
+                            user_id=event.get_sender_id(),
+                            file="base64://" + base64.b64encode(file_bytes).decode("ascii"),
+                            name=selected.name,
+                        )
+                    except Exception as exc:
+                        logger.warning("[request-capture] QQ file upload failed: %s", exc)
+                        yield event.plain_result("🐈‍⬛ QQ 文件发送失败，请查看 AstrBot 日志。")
+                    return
+
+                # Other platforms still use the normal AstrBot file component.
+                # Den will display these once its attachment rendering is added.
+                path_to_send = selected
+                if not raw_mode:
+                    tmp_path = None
                     try:
                         with tempfile.NamedTemporaryFile(
-                            mode="w", encoding="utf-8", suffix=".json",
-                            prefix="requestbody_", delete=False,
+                            mode="wb", prefix="requestbody_", suffix=".json", delete=False
                         ) as tmp:
-                            temp_path = Path(tmp.name)
-                            tmp.write(pretty)
-                        path_to_send = temp_path
-                        event.track_temporary_local_file(str(temp_path))
+                            tmp_path = Path(tmp.name)
+                            tmp.write(file_bytes)
+                        path_to_send = tmp_path
+                        event.track_temporary_local_file(str(tmp_path))
                     except OSError as exc:
-                        if temp_path is not None:
-                            temp_path.unlink(missing_ok=True)
+                        if tmp_path is not None:
+                            tmp_path.unlink(missing_ok=True)
                         logger.warning("[request-capture] Format export failed: %s", exc)
                         yield event.plain_result("🐈‍⬛ 生成美化文件失败，请查看日志。")
                         return
 
-            # The platform sends this file before event-scoped temporary cleanup.
-            yield event.chain_result([File(name=selected.name, file=str(path_to_send.resolve()))])
-            return
+                yield event.chain_result([
+                    File(name=selected.name, file=str(path_to_send.resolve()))
+                ])
+                return
 
-        if action in {"rename", "重命名"}:
-            # Quotes support a current filename containing spaces:
-            # /请求体 rename "Old Name.json" 新名字
-            try:
-                parts = shlex.split(remainder, posix=True)
-            except ValueError:
-                yield event.plain_result("🐈‍⬛ 文件名引号没有闭合。")
+            if action in {"rename", "重命名"}:
+                # Quotes support a current filename containing spaces:
+                # /请求体 rename "Old Name.json" 新名字
+                try:
+                    parts = shlex.split(remainder, posix=True)
+                except ValueError:
+                    yield event.plain_result("🐈‍⬛ 文件名引号没有闭合。")
+                    return
+                if len(parts) < 2:
+                    yield event.plain_result("🐈‍⬛ 用法：/请求体 rename 编号 新名字")
+                    return
+                selector, new_name = parts[0], " ".join(parts[1:])
+                destination_name = self._new_filename(new_name)
+                if destination_name is None:
+                    yield event.plain_result("🐈‍⬛ 新名字不能为空，也不能包含路径分隔符。")
+                    return
+                files = self._saved_files()
+                selected = self._select_file(selector, files)
+                if not selected:
+                    yield event.plain_result("🐈‍⬛ 找不到要重命名的文件。")
+                    return
+                if selected.name == destination_name:
+                    yield event.plain_result(f"🐈‍⬛ 文件已经叫 {selected.name}，无需修改。")
+                    return
+                destination = self.output_dir / destination_name
+                if destination.exists():
+                    yield event.plain_result(f"🐈‍⬛ 已存在 {destination_name}，不会覆盖。")
+                    return
+                try:
+                    await asyncio.to_thread(selected.rename, destination)
+                except OSError as exc:
+                    logger.warning("[request-capture] Rename failed: %s", exc)
+                    yield event.plain_result("🐈‍⬛ 重命名失败，请查看日志。")
+                    return
+                yield event.plain_result(f"🐈‍⬛ 已重命名：\n{selected.name}\n→ {destination.name}")
                 return
-            if len(parts) < 2:
-                yield event.plain_result("🐈‍⬛ 用法：/请求体 rename 编号 新名字")
-                return
-            selector, new_name = parts[0], " ".join(parts[1:])
-            destination_name = self._new_filename(new_name)
-            if destination_name is None:
-                yield event.plain_result("🐈‍⬛ 新名字不能为空，也不能包含路径分隔符。")
-                return
-            files = self._saved_files()
-            selected = self._select_file(selector, files)
-            if not selected:
-                yield event.plain_result("🐈‍⬛ 找不到要重命名的文件。")
-                return
-            if selected.name == destination_name:
-                yield event.plain_result(f"🐈‍⬛ 文件已经叫 {selected.name}，无需修改。")
-                return
-            destination = self.output_dir / destination_name
-            if destination.exists():
-                yield event.plain_result(f"🐈‍⬛ 已存在 {destination_name}，不会覆盖。")
-                return
-            try:
-                await asyncio.to_thread(selected.rename, destination)
-            except OSError as exc:
-                logger.warning("[request-capture] Rename failed: %s", exc)
-                yield event.plain_result("🐈‍⬛ 重命名失败，请查看日志。")
-                return
-            yield event.plain_result(f"🐈‍⬛ 已重命名：\n{selected.name}\n→ {destination.name}")
-            return
 
-        if action in self._DELETE:
-            if not remainder:
-                yield event.plain_result("🐈‍⬛ 用法：/请求体 delete 编号或文件名")
+            if action in self._DELETE:
+                if not remainder:
+                    yield event.plain_result("🐈‍⬛ 用法：/请求体 delete 编号或文件名")
+                    return
+                files = self._saved_files()
+                selected = self._select_file(remainder, files)
+                if not selected:
+                    yield event.plain_result("🐈‍⬛ 找不到要删除的文件。")
+                    return
+                try:
+                    await asyncio.to_thread(selected.unlink)
+                except OSError as exc:
+                    logger.warning("[request-capture] Delete failed: %s", exc)
+                    yield event.plain_result("🐈‍⬛ 删除失败，请查看日志。")
+                    return
+                yield event.plain_result(f"🐈‍⬛ 已删除：{selected.name}")
                 return
-            files = self._saved_files()
-            selected = self._select_file(remainder, files)
-            if not selected:
-                yield event.plain_result("🐈‍⬛ 找不到要删除的文件。")
-                return
-            try:
-                await asyncio.to_thread(selected.unlink)
-            except OSError as exc:
-                logger.warning("[request-capture] Delete failed: %s", exc)
-                yield event.plain_result("🐈‍⬛ 删除失败，请查看日志。")
-                return
-            yield event.plain_result(f"🐈‍⬛ 已删除：{selected.name}")
-            return
 
-        yield event.plain_result("🐈‍⬛ 未识别的指令。发送 /请求体 查看帮助。")
+            yield event.plain_result("🐈‍⬛ 未识别的指令。发送 /请求体 查看帮助。")
+        finally:
+            event.stop_event()
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
