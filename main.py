@@ -180,18 +180,16 @@ class RequestCapture(Star):
     @staticmethod
     def _help() -> str:
         return (
-            "🐈‍⬛ 请求体管理\n"
             "/print         查看开关状态\n"
-            "/print on      开启捕获\n"
-            "/print off     关闭捕获\n"
-            "/请求体 list          列出第 1 页\n"
-            "/请求体 ls 2          列出第 2 页\n"
-            "/请求体 send 3        发送美化 JSON\n"
-            "/请求体 send 3 raw    发送原始 JSON\n"
-            "/请求体 rename 3 新名字   重命名\n"
-            "/请求体 delete 3      删除\n"
-            "编号也可换成完整文件名；latest/new/first/最新 代表最新文件。\n"
-            "英文指令 /requestbody 与 /请求体 相同。"
+            "/print on      开启捕获请求体\n"
+            "/print off     关闭捕获请求体\n"
+            "/请求体 list [n]\n"
+            "/请求体 send 3 [raw]\n"
+            "/请求体 rename 3 新名字\n"
+            "/请求体 delete 3\n\n"
+            "编号也可换成完整文件名\n"
+            "latest/new/first/最新 发送最新文件。\n"
+            "英文指令 /requestbody 与 /请求体 可互换。"
         )
 
     @filter.command("请求体", alias={"requestbody"})
