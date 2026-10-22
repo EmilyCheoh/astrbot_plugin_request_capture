@@ -1,0 +1,6 @@
+name: astrbot_plugin_request_capture
+display_name: "🖨 打印请求体"
+desc: "Toggle raw outgoing LLM request body capture with /print and /stopprint."
+version: v0.1.0
+author: Felis Abyssalis & Noir
+repo: "https://github.com/EmilyCheoh/astrbot_plugin_request_capture"
