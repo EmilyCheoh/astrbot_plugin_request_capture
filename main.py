@@ -1,9 +1,10 @@
-"""Capture final JSON request bodies for OpenAI/Anthropic SDK-backed providers.
+"""Capture outgoing JSON request bodies from OpenAI, Anthropic and Gemini.
 
 This plugin attaches an HTTPX request event hook to provider-owned HTTP clients.
 It never changes the outgoing request, response, or agent conversation.
 """
 import asyncio
+import re
 from datetime import datetime
 from itertools import count
 
@@ -13,6 +14,7 @@ from astrbot.api.star import Context, Star, StarTools
 
 
 class RequestCapture(Star):
+    _GEMINI_PATH = re.compile(r"(?:^|/)models/[^/]+:(?:streamGenerateContent|generateContent)$")
     _API_PATHS = (
         "/chat/completions",
         "/messages",
@@ -34,17 +36,23 @@ class RequestCapture(Star):
         attached = 0
         for provider in self.context.get_all_providers():
             sdk_client = getattr(provider, "client", None)
-            http_client = getattr(sdk_client, "_client", None)
-            if http_client is None:
-                continue
-            hooks = getattr(http_client, "event_hooks", None)
-            if not isinstance(hooks, dict) or not isinstance(hooks.get("request"), list):
-                continue
-            if any(existing is http_client for existing in self._hooked_clients):
-                continue
-            hooks["request"].append(self._capture)
-            self._hooked_clients.append(http_client)
-            attached += 1
+            # OpenAI / Anthropic expose the SDK-owned HTTPX client here.
+            # Gemini uses Google GenAI, with an explicitly supplied HTTPX client.
+            candidates = (
+                getattr(sdk_client, "_client", None),
+                getattr(provider, "_http_client", None),
+            )
+            for http_client in candidates:
+                if http_client is None:
+                    continue
+                hooks = getattr(http_client, "event_hooks", None)
+                if not isinstance(hooks, dict) or not isinstance(hooks.get("request"), list):
+                    continue
+                if any(existing is http_client for existing in self._hooked_clients):
+                    continue
+                hooks["request"].append(self._capture)
+                self._hooked_clients.append(http_client)
+                attached += 1
         return attached
 
     async def _capture(self, request):
@@ -55,7 +63,10 @@ class RequestCapture(Star):
         path = request.url.path.rstrip("/")
         if request.method.upper() != "POST":
             return
-        if not any(path.endswith(suffix) for suffix in self._API_PATHS):
+        if not (
+            any(path.endswith(suffix) for suffix in self._API_PATHS)
+            or self._GEMINI_PATH.search(path)
+        ):
             return
 
         # JSON payloads created by these SDK methods are already materialized.
